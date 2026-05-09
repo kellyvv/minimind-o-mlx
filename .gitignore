@@ -29,3 +29,7 @@ output_audio/
 # IDE / dev
 *.log
 .idea/
+
+# MLX-converted model artifacts (build via `python -m mlx_omni.convert`)
+/minimind-3o-mlx*/
+compare_output/
