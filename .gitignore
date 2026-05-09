@@ -6,3 +6,26 @@ __pycache__/
 .claude/
 .specstory/
 .env
+
+# Python venv
+.venv/
+venv/
+env/
+
+# Downloaded model weights (huge, fetched via modelscope/HF, see README)
+/minimind-3o/
+/model/SenseVoiceSmall/
+/model/siglip2-base-p32-256-ve/
+/model/mimi/
+/model/campplus/
+/out/
+/checkpoints/
+
+# Generated outputs
+*.wav
+*.mp3
+output_audio/
+
+# IDE / dev
+*.log
+.idea/

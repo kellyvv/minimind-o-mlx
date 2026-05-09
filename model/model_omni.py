@@ -138,16 +138,18 @@ class MiniMindOmni(MiniMindForCausalLM):
     def encode_audio_inputs(self, audio_inputs, audio_lens=None):
         if (audio_inputs is None) or (self.audio_encoder is None) or (not audio_inputs.any()): return None
         batch_mask = audio_inputs.flatten(1).any(1)
-        enc_dtype = next(self.audio_encoder.parameters()).dtype
-        valid_fbank = audio_inputs[batch_mask].to(dtype=enc_dtype)
+        enc_param = next(self.audio_encoder.parameters())
+        enc_dtype, enc_device = enc_param.dtype, enc_param.device
+        valid_fbank = audio_inputs[batch_mask].to(device=enc_device, dtype=enc_dtype)
         if audio_lens is not None:
-            valid_lens = audio_lens[batch_mask].to(valid_fbank.device)
+            valid_lens = audio_lens[batch_mask].to(enc_device)
         else:
-            valid_lens = torch.tensor([valid_fbank.size(1)] * valid_fbank.size(0), device=valid_fbank.device)
+            valid_lens = torch.tensor([valid_fbank.size(1)] * valid_fbank.size(0), device=enc_device)
         with torch.no_grad():
             emb, _ = self.audio_encoder(valid_fbank, valid_lens)
-        proj_dtype = next(self.audio_proj.parameters()).dtype
-        emb_list = [self.audio_proj(emb[i, :max(1, min(valid_lens[i].item(), emb.size(1)))].unsqueeze(0).to(proj_dtype)).squeeze(0) for i in range(emb.size(0))]
+        proj_param = next(self.audio_proj.parameters())
+        proj_dtype, proj_device = proj_param.dtype, proj_param.device
+        emb_list = [self.audio_proj(emb[i, :max(1, min(valid_lens[i].item(), emb.size(1)))].unsqueeze(0).to(device=proj_device, dtype=proj_dtype)).squeeze(0) for i in range(emb.size(0))]
         if batch_mask.all(): return emb_list
         out = [None] * audio_inputs.size(0)
         j = 0
@@ -203,6 +205,8 @@ class MiniMindOmni(MiniMindForCausalLM):
             if pixel_attention_mask is not None and not pixel_attention_mask.any():
                 pv = image_inputs['pixel_values']
                 return pv.new_zeros(pv.size(0), pv.size(1), self.config.image_hidden_size)
+            enc_param = next(self.vision_encoder.parameters())
+            image_inputs = {k: (v.to(device=enc_param.device, dtype=enc_param.dtype) if k == 'pixel_values' else v.to(enc_param.device)) for k, v in image_inputs.items()}
         with torch.no_grad():
             outputs = self.vision_encoder(**image_inputs)
         return outputs.last_hidden_state
@@ -212,9 +216,11 @@ class MiniMindOmni(MiniMindForCausalLM):
         if pixel_values is None or self.vision_encoder is None: return None
         mask = pixel_values.flatten(1).any(1)
         if not mask.any(): return pixel_values.new_zeros(pixel_values.size(0), self.config.image_token_len, self.config.hidden_size)
-        with torch.no_grad(): emb = self.vision_encoder(pixel_values=pixel_values[mask]).last_hidden_state
+        enc_param = next(self.vision_encoder.parameters())
+        with torch.no_grad(): emb = self.vision_encoder(pixel_values=pixel_values[mask].to(device=enc_param.device, dtype=enc_param.dtype)).last_hidden_state
         if emb.dim() == 2: emb = emb.unsqueeze(0)
-        emb = self.vision_proj(emb)
+        proj_param = next(self.vision_proj.parameters())
+        emb = self.vision_proj(emb.to(device=proj_param.device, dtype=proj_param.dtype))
         if mask.all(): return emb
         idx = mask.nonzero().view(-1, 1, 1).expand_as(emb)
         return emb.new_zeros(pixel_values.size(0), *emb.shape[1:]).scatter(0, idx, emb)
@@ -366,14 +372,26 @@ class MiniMindOmni(MiniMindForCausalLM):
                 generated_tokens.append(text_token)
                 if not think_end_step and generated_tokens[-len(self.config.think_end_ids):] == list(self.config.think_end_ids): think_end_step = step + 2
                 audio_step = (step - think_end_step) if think_end_step else -1
+            # Talker 采样可调参数（默认值与原版一致）
+            a_temp = args.get('audio_temperature', 0.2)
+            a_topk = args.get('audio_top_k', 50)
+            a_rp = args.get('audio_rep_penalty', 1.05)
+            a_rp_win = args.get('audio_rep_window', 3)
+            a_greedy = args.get('audio_greedy', False)
             for i, al in enumerate(out.audio_logits):
                 if audio_step < i:
                     audio_codes[i].append(self.audio_pad_token)
                 else:
-                    logits_i = al[0, -1, :].clone() / 0.2
-                    for prev_code in audio_codes[i][-3:]: score = logits_i[prev_code]; logits_i[prev_code] = torch.where(score > 0, score / 1.05, score * 1.05)
-                    top_val, top_idx = logits_i.topk(50)
-                    code = top_idx[torch.multinomial(F.softmax(top_val, dim=-1), 1)].item()
+                    logits_i = al[0, -1, :].clone() / max(a_temp, 1e-6)
+                    if a_rp != 1.0 and a_rp_win > 0:
+                        for prev_code in audio_codes[i][-a_rp_win:]:
+                            score = logits_i[prev_code]
+                            logits_i[prev_code] = torch.where(score > 0, score / a_rp, score * a_rp)
+                    if a_greedy:
+                        code = int(logits_i.argmax().item())
+                    else:
+                        top_val, top_idx = logits_i.topk(a_topk)
+                        code = top_idx[torch.multinomial(F.softmax(top_val, dim=-1), 1)].item()
                     audio_codes[i].append(code)
                     if audio_stop_pos[i] is None and code >= 2048: audio_stop_pos[i] = len(audio_codes[i]) - 1
 

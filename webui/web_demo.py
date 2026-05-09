@@ -69,10 +69,11 @@ def build_ids(prompt, history):
 def _mimi_decode(frames):
     codes = [f for f in frames if f and len(f) == 8]
     if not codes or not M['mimi']: return None
-    mc = torch.tensor(codes, dtype=torch.long).T.unsqueeze(0)
+    mimi_dev = next(M['mimi'].parameters()).device
+    mc = torch.tensor(codes, dtype=torch.long, device=mimi_dev).T.unsqueeze(0)
     mc = torch.where(mc >= 2049, torch.zeros_like(mc), mc)
     with torch.no_grad():
-        au = M['mimi'].decode(mc).audio_values.squeeze().cpu().numpy()
+        au = M['mimi'].decode(mc).audio_values.squeeze().float().cpu().numpy()
     return au, mc.shape[-1]
 
 def pcm_bytes(frames, ov):
@@ -210,8 +211,11 @@ def load_main_model(model_path, model_name):
         object.__setattr__(m, 'audio_encoder', audio_encoder)
         object.__setattr__(m, 'audio_processor', audio_processor)
         m = m.half().eval().to(M['device'])
-        if m.audio_encoder: m.audio_encoder.to(M['device'])
-        if m.vision_encoder: m.vision_encoder.to(M['device'])
+        # MPS: 把 SenseVoice / SigLIP 留在 CPU 更稳（FunASR 部分算子在 MPS 上不一定支持）
+        # 主模型 (Thinker+Talker+projector) 保持在目标设备，由 model_omni.py 内部跨设备调度
+        enc_device = 'cpu' if M['device'].startswith('mps') else M['device']
+        if m.audio_encoder: m.audio_encoder.to(enc_device)
+        if m.vision_encoder: m.vision_encoder.to(enc_device)
         M['tokenizer'], M['model'], M['model_name'] = tok, m, model_name
         params = sum(p.numel() for p in m.parameters()) / 1e6
         print(f'Loaded model: {model_name} ({params:.2f}M)')
@@ -415,7 +419,12 @@ def realtime(ws):
 
             frames, full_text, interrupted = [], '', False
             for y, af in run_generate(x, audio_inputs, audio_lens, pixel_values,
-                                       max_new_tokens=512, temperature=0.7, **va_rt):
+                                       max_new_tokens=512, temperature=0.7,
+                                       audio_temperature=M['cfg'].audio_temperature,
+                                       audio_top_k=M['cfg'].audio_top_k,
+                                       audio_rep_penalty=M['cfg'].audio_rep_penalty,
+                                       audio_greedy=M['cfg'].audio_greedy,
+                                       **va_rt):
                 if poll_interrupt() or session.interrupt: interrupted = True; break
                 if y is not None:
                     ans = M['tokenizer'].decode(y[0].tolist(), skip_special_tokens=True)
@@ -442,8 +451,10 @@ def realtime(ws):
 
 def init_model(args):
     M['cfg'] = args; M['device'] = args.device
+    # FunASR / SenseVoice 在 MPS 上不稳定，统一放 CPU（仅做 ASR 转文本，速度可接受）
+    asr_device = 'cpu' if args.device.startswith('mps') else args.device
     with contextlib.redirect_stdout(io.StringIO()):
-        M['asr'] = AutoModel(model='../model/SenseVoiceSmall', trust_remote_code=True, device=args.device, disable_update=True)
+        M['asr'] = AutoModel(model='../model/SenseVoiceSmall', trust_remote_code=True, device=asr_device, disable_update=True)
     M['models'] = scan_hf_models(args.load_from)
     if not M['models']:
         raise RuntimeError(f"未在 {os.path.abspath(args.load_from)} 找到 transformers 模型")
@@ -451,10 +462,13 @@ def init_model(args):
     load_main_model(M['models'][model_name], model_name)
     try:
         from transformers import MimiModel
-        M['mimi'] = MimiModel.from_pretrained('../model/mimi').eval().to(args.device)
-        if args.device != 'cpu': M['mimi'] = M['mimi'].half()
-        print('Mimi model loaded')
-    except: M['mimi'] = None
+        mimi_device = os.environ.get('MIMI_DEVICE', args.device)  # 默认跟主设备走 (MPS/CUDA/CPU)
+        M['mimi'] = MimiModel.from_pretrained('../model/mimi').eval().to(mimi_device)
+        if mimi_device != 'cpu': M['mimi'] = M['mimi'].half()
+        print(f'Mimi model loaded on {mimi_device} ({"fp16" if mimi_device != "cpu" else "fp32"})')
+    except Exception as e:
+        print(f'Mimi load failed: {e}')
+        M['mimi'] = None
     try:
         from modelscope.models.audio.sv.DTDNN import CAMPPlus
         M['campplus'] = CAMPPlus(feat_dim=80, embedding_size=192, growth_rate=32, bn_size=4,
@@ -485,19 +499,27 @@ def init_model(args):
         ids = torch.tensor([[1, 2, 3]], device=args.device)
         au = torch.full((1, 8, 3), 2049, dtype=torch.long, device=args.device)
         M['model'].forward(torch.cat((au, ids.unsqueeze(1)), dim=1))
-        if M['model'].audio_encoder: M['model'].audio_encoder(torch.zeros(1, 100, 560, device=args.device), torch.tensor([100], device=args.device))
-        if M['mimi']: M['mimi'].decode(torch.zeros(1, 8, 1, dtype=torch.long))
+        if M['model'].audio_encoder:
+            enc_dev = next(M['model'].audio_encoder.parameters()).device
+            M['model'].audio_encoder(torch.zeros(1, 100, 560, device=enc_dev), torch.tensor([100], device=enc_dev))
+        if M['mimi']:
+            mimi_dev = next(M['mimi'].parameters()).device
+            M['mimi'].decode(torch.zeros(1, 8, 1, dtype=torch.long, device=mimi_dev))
     print('Warmup done!')
 
 
 if __name__ == '__main__':
     p = argparse.ArgumentParser()
     p.add_argument('--load_from', default='./', help='模型权重搜索目录；目录下可放多个 HF 格式模型，WebUI 会自动扫描并允许切换。')
-    p.add_argument('--device', default='cuda' if torch.cuda.is_available() else 'cpu', help='推理设备；CUDA 可用时默认 cuda。显存不足或排查环境问题时可改为 cpu。')
+    p.add_argument('--device', default=('cuda' if torch.cuda.is_available() else ('mps' if hasattr(torch.backends, 'mps') and torch.backends.mps.is_available() else 'cpu')), help='推理设备 (cuda / mps / cpu)。显存不足或排查环境问题时可改为 cpu。')
     p.add_argument('--port', default=7860, type=int, help='WebUI 服务端口；端口被占用或需要同时启动多个实例时调整。')
     p.add_argument('--audio_chunk_frames', default=4, type=int, help='流式播放每次解码的 Mimi frame 数；默认 4 约 320ms。WebUI 播放卡顿时可调大到 8/12，低延迟优先时保持 4。')
     p.add_argument('--audio_overlap', default=2, type=int, help='分块 Mimi 解码的重叠帧数；默认 2 用于缓解块边界断裂。一般不需要调整，边界杂音明显时可适当增大。')
     p.add_argument('--max_history_turns', default=0, type=int, help='对话历史轮数；默认 0 不带历史以降低延迟和显存。需要多轮上下文时调大，但会增加 prefill 成本。')
+    p.add_argument('--audio_temperature', default=0.2, type=float, help='Talker 采样温度；默认 0.2。听感颤抖时可降到 0.1 或开 --audio_greedy。')
+    p.add_argument('--audio_top_k', default=50, type=int, help='Talker top-k；默认 50。颤抖时可降到 20 收紧分布。')
+    p.add_argument('--audio_rep_penalty', default=1.0, type=float, help='Talker 防重复惩罚；原版 1.05 会让长元音 wobble，默认改 1.0 (关闭)。')
+    p.add_argument('--audio_greedy', action='store_true', help='Talker 走 argmax 完全确定性输出；最稳但缺少自然变化。')
     args = p.parse_args()
     init_model(args)
     app.run(host='0.0.0.0', port=args.port, threaded=True)
