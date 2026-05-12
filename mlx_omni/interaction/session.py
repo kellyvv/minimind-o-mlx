@@ -219,16 +219,14 @@ class InteractionSession:
 
     def _handle_audio_chunk(self, raw_bytes: bytes):
         samples = np.frombuffer(raw_bytes, dtype=np.int16).astype(np.float32) / 32768.0
-        # 直接把这段送 VAD
+        cur = self.state()
+        # foreground 生成中也要让 VAD 持续跑用于检测 barge_in
+        self._vad.generating = (cur == SPEAKING)
         status = self._vad.push_chunk(samples)
         speaking = self._vad.speaking
-        # 发个轻量 vad 事件 (不进 timeline, 否则太密)
         self._send({"type": "vad", "speaking": speaking})
 
-        # 状态转换
-        cur = self.state()
         if status == "interrupt":
-            # foreground 正在 speaking, 用户开口
             if cur == SPEAKING:
                 self.timeline.add(Event.now(BARGE_IN))
                 self._fg_stop_event.set()
@@ -246,7 +244,12 @@ class InteractionSession:
     # ====================================================================
 
     def _do_asr_and_trigger(self, audio_samples: np.ndarray):
-        """ASR 同步跑 (CPU SenseVoice，通常 < 1s)，然后启动 foreground."""
+        """ASR + foreground 都在 main_loop 线程跑.
+
+        关键: 不开 worker thread, MLX 在非主线程的 Metal context 行为不稳。
+        生成的每一步都会从 input_q 抽干积压的 audio chunk 给 VAD,
+        VAD 触发 barge_in 时 set stop_event, 立即跳出 generate 循环。
+        """
         self._set_state(THINKING)
         text = ""
         if self.asr is not None:
@@ -263,35 +266,52 @@ class InteractionSession:
         if not text:
             self._set_state(LISTENING)
             return
-        self._trigger_foreground(prompt=text)
+        self._foreground_generate(prompt=text)
 
-    def _trigger_foreground(self, prompt: str):
-        """启动一个 foreground generate 子线程; 如已有则先停掉."""
-        with self._fg_lock:
-            # 等老 worker 退出
-            old = self._fg_worker
-            if old is not None and old.is_alive():
-                self._fg_stop_event.set()
-                old.join(timeout=2.0)
-            self._fg_stop_event.clear()
-            self._fg_worker = threading.Thread(
-                target=self._foreground_generate, args=(prompt,), daemon=True, name="iact-fg"
-            )
-            self._fg_worker.start()
+    def _drain_input_for_vad(self):
+        """foreground 期间抽干 input_q, 只跑 VAD 检 barge_in. 控制消息也处理."""
+        while True:
+            try:
+                data = self._input_q.get_nowait()
+            except queue.Empty:
+                return
+            if isinstance(data, (bytes, bytearray)):
+                samples = np.frombuffer(data, dtype=np.int16).astype(np.float32) / 32768.0
+                self._vad.generating = True
+                status = self._vad.push_chunk(samples)
+                speaking = self._vad.speaking
+                self._send({"type": "vad", "speaking": speaking})
+                if status == "interrupt":
+                    self.timeline.add(Event.now(BARGE_IN))
+                    self._fg_stop_event.set()
+                    self._set_state(INTERRUPTED)
+                    return
+            else:
+                try:
+                    m = json.loads(data)
+                    if m.get("type") in ("stop", "end"):
+                        self._fg_stop_event.set()
+                        if m.get("type") == "end":
+                            self.stop()
+                        return
+                except Exception:
+                    pass
 
     def _foreground_generate(self, prompt: str):
+        """在 main_loop 线程跑生成 (MLX 不能在子线程稳定运行)."""
         from mlx_omni.generate_omni import stream_generate_omni
 
-        # 从 timeline 派生历史 (排除当前这个 user message, _do_asr_and_trigger 已经把它 add 到 timeline)
         history_full = self.timeline.derive_history(max_turns=self.cfg.max_history_turns + 1)
         history = history_full[:-1] if history_full and history_full[-1].get("role") == "user" else history_full
 
         self._set_state(SPEAKING)
+        self._fg_stop_event.clear()
         t0 = time.time()
         ttft_t = ttft_a = None
         n_text = n_audio = 0
         audio_buffer: List[List[int]] = []
         interrupted = False
+        self.log(f"[fg] start, prompt={prompt[:60]!r}, history_len={len(history)}")
 
         try:
             for text_seg, audio_frame in stream_generate_omni(
@@ -307,6 +327,8 @@ class InteractionSession:
                 history=history,
                 stop_event=self._fg_stop_event,
             ):
+                # 每个 token 抽干输入 → VAD → 检 barge_in
+                self._drain_input_for_vad()
                 if self._fg_stop_event.is_set():
                     interrupted = True; break
                 if text_seg:
@@ -327,18 +349,19 @@ class InteractionSession:
                     if len(audio_buffer) >= self.cfg.audio_chunk_frames:
                         self._emit_pcm(audio_buffer)
                         audio_buffer = []
-            # flush 尾部
             if not interrupted and audio_buffer:
                 self._emit_pcm(audio_buffer)
         except Exception as e:
+            import traceback; traceback.print_exc()
             self.log(f"[fg] exception: {e}")
             interrupted = True
 
+        dt = time.time() - t0
+        self.log(f"[fg] done | t={n_text} a={n_audio} dt={dt:.2f}s interrupted={interrupted}")
         self.timeline.add(Event.now(GEN_DONE, interrupted=interrupted,
-                                    n_text=n_text, n_audio=n_audio,
-                                    dt=time.time() - t0))
+                                    n_text=n_text, n_audio=n_audio, dt=dt))
         self._send({"type": "done", "interrupted": interrupted})
-        # 状态切回 listening (打断也回到 listening)
+        self._vad.generating = False
         self._set_state(LISTENING)
 
     def _emit_pcm(self, frames: List[List[int]]):
