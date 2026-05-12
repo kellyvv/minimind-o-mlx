@@ -261,8 +261,10 @@ def realtime(ws):
             audio_chunk_frames=12,
             foreground_temperature=0.7,
             audio_rep_penalty=1.0,
-            use_streaming_session=True,   # Stage 3: 跨 turn 复用 KV cache
-            inject_bg_results=True,       # Stage 2: 自动注入 background 结果
+            # Stage 3 默认关 — KV cache 跨 turn 复用有一致性风险, 收益对 0.1B 模型有限.
+            # 想 A/B 直接改下面这行为 True 重启即可.
+            use_streaming_session=False,
+            inject_bg_results=True,        # Stage 2 默认开 — 后台任务结果会前置注入
         ),
         logger=print,
     )
