@@ -44,8 +44,13 @@ from .events import (
     AUDIO_CHUNK, TEXT_DELTA, IMAGE_FRAME, CONTROL_MSG,
     SPEECH_START, SPEECH_END, BARGE_IN, ASR_RESULT,
     MODEL_TEXT, MODEL_AUDIO, MODEL_PCM, STATUS, TTFT, GEN_DONE,
+    BG_JOB_START, BG_JOB_RESULT,
 )
 from .timeline import Timeline
+from .background import (
+    BackgroundScheduler, BackgroundJob,
+    make_echo_job, make_summarize_history_job, make_current_time_job,
+)
 
 
 # 状态机
@@ -69,6 +74,10 @@ class SessionConfig:
     audio_top_k: int = 50
     audio_rep_penalty: float = 1.0
     audio_greedy: bool = False
+    # Stage 3: 持久 KV cache 复用 (跨 turn 不重新 prefill)
+    use_streaming_session: bool = False
+    # Stage 2: 后台任务结果自动插入下一轮 assistant prompt
+    inject_bg_results: bool = True
 
 
 class InteractionSession:
@@ -109,6 +118,12 @@ class InteractionSession:
         # VAD (复用 PyTorch 版的纯 Python 实现, 仅依赖 onnxruntime)
         from model.model_omni import RealtimeSession
         self._vad = RealtimeSession(vad_path)
+
+        # Stage 2: 后台任务调度器
+        self.scheduler = BackgroundScheduler(on_event=self._on_bg_event)
+
+        # Stage 3: 持久 streaming session (lazy init, 仅在 use_streaming_session=True 时启用)
+        self._streaming: Optional[Any] = None
 
     # ====================================================================
     # 状态控制
@@ -203,19 +218,81 @@ class InteractionSession:
         except Exception:
             return
         t = msg.get("type")
-        self.timeline.add(Event.now(CONTROL_MSG, **msg))
+        # 不能直接 **msg 展开 (msg 里有 'type' 键, 会和 Event.now 的 type 参数冲突)
+        payload = {k: v for k, v in msg.items() if k != "type"}
+        self.timeline.add(Event.now(CONTROL_MSG, msg_type=t, **payload))
         if t == "context":
-            # 老的 context 消息保留; history 不再由前端推, 由 timeline 派生
             pass
         elif t == "stop":
-            self._fg_stop_event.set()  # 仅停当前 foreground
+            self._fg_stop_event.set()
         elif t == "end":
             self.stop()
         elif t == "text":
             text = msg.get("content", "")
             if text:
                 self.timeline.add(Event.now(TEXT_DELTA, text=text))
-                self._trigger_foreground(prompt=text)
+                self._foreground_generate(prompt=text)
+        elif t == "bg_submit":
+            self._handle_bg_submit(msg)
+        elif t == "bg_cancel":
+            jid = msg.get("job_id")
+            if jid: self.scheduler.cancel(jid)
+
+    # ====================================================================
+    # Stage 2: 后台任务
+    # ====================================================================
+
+    def _on_bg_event(self, kind: str, job: BackgroundJob):
+        """BackgroundScheduler 完成回调; 落 timeline + 通知前端."""
+        if kind == "start":
+            self.timeline.add(Event.now(BG_JOB_START, job_id=job.job_id, job_kind=job.kind))
+            self._send({"type": "bg_start", "job_id": job.job_id, "kind": job.kind})
+        elif kind == "result":
+            self.timeline.add(Event.now(
+                BG_JOB_RESULT,
+                job_id=job.job_id, job_kind=job.kind,
+                result=job.result, error=job.error,
+                duration=job.duration,
+            ))
+            r_str = (job.result[:300] if isinstance(job.result, str) else str(job.result)[:300]) if job.result is not None else None
+            self._send({
+                "type": "bg_result",
+                "job_id": job.job_id, "kind": job.kind,
+                "result": r_str, "error": job.error,
+                "duration": round(job.duration, 2),
+            })
+
+    def _handle_bg_submit(self, msg: dict):
+        kind = msg.get("kind", "echo")
+        if kind == "echo":
+            text = msg.get("text", "(no text)")
+            delay = float(msg.get("delay", 2.0))
+            self.scheduler.submit("echo", make_echo_job(text, delay), text=text, delay=delay)
+        elif kind == "summarize":
+            self.scheduler.submit("summarize", make_summarize_history_job(self.timeline))
+        elif kind == "time":
+            self.scheduler.submit("time", make_current_time_job())
+        else:
+            self.log(f"[bg] unknown kind: {kind}")
+
+    def submit_background(self, kind: str, fn, **meta) -> str:
+        return self.scheduler.submit(kind, fn, **meta)
+
+    def _consume_bg_results(self) -> str:
+        """收割已完成但 foreground 未消费的 job 结果, 拼成一段前缀注入下轮 assistant."""
+        if not self.cfg.inject_bg_results:
+            return ""
+        unconsumed = self.scheduler.list_unconsumed_results()
+        if not unconsumed:
+            return ""
+        snippets = []
+        for j in sorted(unconsumed, key=lambda x: x.finished or 0):
+            if j.error:
+                self.scheduler.mark_consumed(j.job_id); continue
+            r = j.result if isinstance(j.result, str) else str(j.result)
+            snippets.append(f"[background:{j.kind}] {r[:200]}")
+            self.scheduler.mark_consumed(j.job_id)
+        return "\n".join(snippets)
 
     def _handle_audio_chunk(self, raw_bytes: bytes):
         samples = np.frombuffer(raw_bytes, dtype=np.int16).astype(np.float32) / 32768.0
@@ -298,11 +375,22 @@ class InteractionSession:
                     pass
 
     def _foreground_generate(self, prompt: str):
-        """在 main_loop 线程跑生成 (MLX 不能在子线程稳定运行)."""
-        from mlx_omni.generate_omni import stream_generate_omni
+        """在 main_loop 线程跑生成 (MLX 不能在子线程稳定运行).
 
+        新增能力 (stage 2/3):
+          - 自动消费 background scheduler 已完成的结果, 注入 prompt 头
+          - 可选用 OmniStreamingSession (cfg.use_streaming_session) 复用 KV cache
+        """
         history_full = self.timeline.derive_history(max_turns=self.cfg.max_history_turns + 1)
         history = history_full[:-1] if history_full and history_full[-1].get("role") == "user" else history_full
+
+        # Stage 2: 把 background 结果作为系统级 context 前置注入
+        bg_context = self._consume_bg_results()
+        if bg_context:
+            full_prompt = f"{bg_context}\n\n用户问: {prompt}"
+            self.log(f"[fg] injecting {bg_context.count(chr(10))+1} bg result(s) into prompt")
+        else:
+            full_prompt = prompt
 
         self._set_state(SPEAKING)
         self._fg_stop_event.clear()
@@ -311,11 +399,16 @@ class InteractionSession:
         n_text = n_audio = 0
         audio_buffer: List[List[int]] = []
         interrupted = False
-        self.log(f"[fg] start, prompt={prompt[:60]!r}, history_len={len(history)}")
+        mode = "streaming" if self.cfg.use_streaming_session else "stateless"
+        self.log(f"[fg] start[{mode}], prompt={full_prompt[:60]!r}, history_len={len(history)}")
 
-        try:
-            for text_seg, audio_frame in stream_generate_omni(
-                self.model, self.tokenizer, prompt,
+        # Stage 3: 选择生成路径
+        if self.cfg.use_streaming_session:
+            gen_iter = self._streaming_generate(full_prompt, history)
+        else:
+            from mlx_omni.generate_omni import stream_generate_omni
+            gen_iter = stream_generate_omni(
+                self.model, self.tokenizer, full_prompt,
                 max_new_tokens=self.cfg.foreground_max_new_tokens,
                 temperature=self.cfg.foreground_temperature,
                 top_p=self.cfg.foreground_top_p,
@@ -326,7 +419,10 @@ class InteractionSession:
                 audio_greedy=self.cfg.audio_greedy,
                 history=history,
                 stop_event=self._fg_stop_event,
-            ):
+            )
+
+        try:
+            for text_seg, audio_frame in gen_iter:
                 # 每个 token 抽干输入 → VAD → 检 barge_in
                 self._drain_input_for_vad()
                 if self._fg_stop_event.is_set():
@@ -371,3 +467,28 @@ class InteractionSession:
         pcm = (wav * 32767).clip(-32768, 32767).astype(np.int16).tobytes()
         self.timeline.add(Event.now(MODEL_PCM, bytes=len(pcm)))
         self._send({"type": "pcm", "data": base64.b64encode(pcm).decode()})
+
+    # ====================================================================
+    # Stage 3: 持久 KV streaming session
+    # ====================================================================
+
+    def _streaming_generate(self, prompt: str, history: list):
+        """用 OmniStreamingSession 生成 (跨 turn 复用 KV cache)."""
+        if self._streaming is None:
+            from .streaming_session import OmniStreamingSession
+            self._streaming = OmniStreamingSession(
+                self.model, self.tokenizer, self.cfg,
+                logger=self.log,
+            )
+        yield from self._streaming.generate_turn(
+            prompt, history,
+            max_new_tokens=self.cfg.foreground_max_new_tokens,
+            temperature=self.cfg.foreground_temperature,
+            top_p=self.cfg.foreground_top_p,
+            top_k=self.cfg.foreground_top_k,
+            audio_temperature=self.cfg.audio_temperature,
+            audio_top_k=self.cfg.audio_top_k,
+            audio_rep_penalty=self.cfg.audio_rep_penalty,
+            audio_greedy=self.cfg.audio_greedy,
+            stop_event=self._fg_stop_event,
+        )

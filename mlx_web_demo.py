@@ -261,6 +261,8 @@ def realtime(ws):
             audio_chunk_frames=12,
             foreground_temperature=0.7,
             audio_rep_penalty=1.0,
+            use_streaming_session=True,   # Stage 3: 跨 turn 复用 KV cache
+            inject_bg_results=True,       # Stage 2: 自动注入 background 结果
         ),
         logger=print,
     )
