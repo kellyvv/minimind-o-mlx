@@ -1,17 +1,18 @@
-"""InteractionSession - 实时通话主状态机 (Thinking Machines interaction-model 风格 stage 1).
+"""InteractionSession - 实时通话主状态机 (Thinking Machines interaction-model 风格).
 
 设计思路:
   - WebSocket 来的字节流和文本控制消息 → input_queue
-  - 主循环按事件驱动: 跑 VAD / 触发状态转换 / 启动 foreground generate
-  - foreground generate 在子线程跑, 可被外部 stop_event 中断
-  - 模型输出 (text / pcm) 也写到 output_queue, 由独立线程发回 WebSocket
-  - 所有动作都在 timeline 上留痕, 让 scheduler 后面能据此做更智能的调度
+  - 主循环按事件驱动: 跑 VAD / 触发状态转换 / 调 foreground generate
+  - foreground generate **同步**在主循环线程跑 (MLX Metal context 在非主线程不稳定),
+    每个 token 之间通过 _drain_input_for_vad() 抽干积压音频, VAD 触发 barge_in 时
+    set foreground_stop_event, 下一个 token 检查即可立即退出
+  - 模型输出 (text / pcm) 走独立 output_loop 线程串行写 WebSocket, 避免并发 send
+  - 所有动作都在 timeline 上留痕, scheduler / background 可据此做调度决策
 
-四个线程:
-  1. recv_loop          — ws.receive → input_queue (control + bytes 分类)
-  2. main_loop          — 主调度 (在调用方线程跑)，按事件状态机调动作
-  3. foreground_loop    — 每次 trigger 都新起一个 worker, 跑 stream_generate_omni
-  4. output_loop        — output_queue → ws.send (避免并发 send)
+三个长寿线程 (per WebSocket connection):
+  1. recv_loop     — ws.receive → input_queue (不解析)
+  2. main_loop     — 主调度 (调用方线程)，按事件状态机调动作 + 跑 foreground 生成
+  3. output_loop   — output_queue → ws.send (串行化)
 
 状态机:
 
@@ -20,12 +21,12 @@
        │                       speech_end
        │                            │
        │                            ▼
-   gen_done ◀── speaking ◀── thinking (ASR 完成, foreground 启动)
-       │           │
+   listening ◀── speaking ◀── thinking (ASR 完成, foreground 启动)
+       ▲           │
        │      barge_in
        │           │
        │           ▼
-       └───── interrupted ── (等下个 speech_end 重新进 thinking)
+       └───── interrupted ── (foreground 跳出循环, 状态切回 listening)
 """
 from __future__ import annotations
 import base64
@@ -78,6 +79,12 @@ class SessionConfig:
     use_streaming_session: bool = False
     # Stage 2: 后台任务结果自动插入下一轮 assistant prompt
     inject_bg_results: bool = True
+    # 流式 Mimi 解码: 每次解码时多带 N 帧上下文, 输出时丢掉前面 overlap_drop 帧的样本.
+    # 减少 chunk 边界的相位跳变 (实测能显著降低"颤抖"). 0 = 关闭, 默认 4 ≈ 320ms.
+    audio_overlap: int = 4
+    # 边界淡入淡出长度 (samples) — 在新 PCM 块开头做线性 ramp-in
+    # 进一步抹平和上一块的拼接处. 0 = 关闭, 默认 240 ≈ 10ms @ 24kHz.
+    audio_crossfade_samples: int = 240
 
 
 class InteractionSession:
@@ -124,6 +131,9 @@ class InteractionSession:
 
         # Stage 3: 持久 streaming session (lazy init, 仅在 use_streaming_session=True 时启用)
         self._streaming: Optional[Any] = None
+
+        # PCM crossfade 状态: 每 turn 第一块不做 ramp-in
+        self._first_audio_chunk_of_turn = True
 
     # ====================================================================
     # 状态控制
@@ -380,6 +390,7 @@ class InteractionSession:
         新增能力 (stage 2/3):
           - 自动消费 background scheduler 已完成的结果, 注入 prompt 头
           - 可选用 OmniStreamingSession (cfg.use_streaming_session) 复用 KV cache
+          - 流式 Mimi 解码带 overlap + 端口 crossfade (P2b 修复颤抖)
         """
         history_full = self.timeline.derive_history(max_turns=self.cfg.max_history_turns + 1)
         history = history_full[:-1] if history_full and history_full[-1].get("role") == "user" else history_full
@@ -397,7 +408,8 @@ class InteractionSession:
         t0 = time.time()
         ttft_t = ttft_a = None
         n_text = n_audio = 0
-        audio_buffer: List[List[int]] = []
+        audio_pending: List[List[int]] = []     # 本块还没解码的新帧
+        audio_history: List[List[int]] = []     # 本 turn 已生成的全部帧 (用作 overlap 上下文)
         interrupted = False
         mode = "streaming" if self.cfg.use_streaming_session else "stateless"
         self.log(f"[fg] start[{mode}], prompt={full_prompt[:60]!r}, history_len={len(history)}")
@@ -440,13 +452,14 @@ class InteractionSession:
                         ttft_a = (time.time() - t0) * 1000
                         self.timeline.add(Event.now(TTFT, kind="audio", ms=ttft_a))
                         self._send({"type": "ttft", "audio_ttft": round(ttft_a, 1)})
-                    audio_buffer.append(audio_frame)
+                    audio_pending.append(audio_frame)
+                    audio_history.append(audio_frame)
                     n_audio += 1
-                    if len(audio_buffer) >= self.cfg.audio_chunk_frames:
-                        self._emit_pcm(audio_buffer)
-                        audio_buffer = []
-            if not interrupted and audio_buffer:
-                self._emit_pcm(audio_buffer)
+                    if len(audio_pending) >= self.cfg.audio_chunk_frames:
+                        self._emit_pcm_chunked(audio_history, len(audio_pending))
+                        audio_pending = []
+            if not interrupted and audio_pending:
+                self._emit_pcm_chunked(audio_history, len(audio_pending))
         except Exception as e:
             import traceback; traceback.print_exc()
             self.log(f"[fg] exception: {e}")
@@ -457,15 +470,41 @@ class InteractionSession:
         self.timeline.add(Event.now(GEN_DONE, interrupted=interrupted,
                                     n_text=n_text, n_audio=n_audio, dt=dt))
         self._send({"type": "done", "interrupted": interrupted})
+        # 本 turn 结束, 重置 crossfade 起点 (下 turn 第一块不做 crossfade)
+        self._first_audio_chunk_of_turn = True
         self._vad.generating = False
         self._set_state(LISTENING)
 
-    def _emit_pcm(self, frames: List[List[int]]):
-        wav = self.mimi.decode(frames)
+    def _emit_pcm_chunked(self, all_frames: List[List[int]], new_frame_count: int):
+        """带 overlap + 边界 crossfade 的流式 Mimi 解码.
+
+        - 解码窗 = 新增 new_frame_count 帧 + 前面 overlap 帧 (作为 codec 上下文)
+        - 解码出的 PCM 把前面 overlap 那段样本扔掉, 只保留 "新增帧" 对应的样本
+        - 把新 PCM 块开头一小段做线性 ramp-in, 抹平和上一块的拼接处
+        """
+        if not all_frames or new_frame_count <= 0:
+            return
+        overlap = min(self.cfg.audio_overlap, len(all_frames) - new_frame_count)
+        decode_n = new_frame_count + overlap
+        decode_frames = all_frames[-decode_n:]
+        wav = self.mimi.decode(decode_frames)
         if wav is None:
             return
+        # 按比例丢掉前面 overlap 帧的样本
+        if overlap > 0:
+            drop = int(overlap * len(wav) / decode_n)
+            wav = wav[drop:]
+        # 边界 crossfade: 新块开头做 ramp-in
+        cfd = self.cfg.audio_crossfade_samples
+        if cfd > 0 and not getattr(self, "_first_audio_chunk_of_turn", True) and len(wav) > cfd:
+            ramp = np.linspace(0.0, 1.0, cfd, dtype=np.float32)
+            wav[:cfd] = wav[:cfd] * ramp
+        self._first_audio_chunk_of_turn = False
         pcm = (wav * 32767).clip(-32768, 32767).astype(np.int16).tobytes()
-        self.timeline.add(Event.now(MODEL_PCM, bytes=len(pcm)))
+        self.timeline.add(Event.now(
+            MODEL_PCM,
+            bytes=len(pcm), new_frames=new_frame_count, overlap=overlap,
+        ))
         self._send({"type": "pcm", "data": base64.b64encode(pcm).decode()})
 
     # ====================================================================

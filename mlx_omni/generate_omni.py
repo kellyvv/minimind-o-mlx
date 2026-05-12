@@ -123,12 +123,12 @@ def stream_generate_omni(
         - text_segment 是新解码出的字符串增量
         - audio_frame 是 8 元素 list, 每个是 [0, 2112) 的 Mimi code (或包含 stop>=2048)
 
-    Stage-1 interaction-model 改造:
-        stop_event: 可选 threading.Event；每步循环开头检查，被 set 时立即 break,
-                    并把当前已生成的 partial state (audio_codes, audio_stop_pos) 写到
-                    generator.__dict__['partial'] 以便外层取回 (用于 InteractionSession
-                    在被打断时把 assistant 半句话记录到 timeline).
-        on_step:   可选 callable(step, text_token, audio_step) — 每步采样完成后调用,
+    Stage-1 interaction-model 钩子:
+        stop_event: 可选 threading.Event; 每步循环开头检查, 被 set 时立即 break
+                    (用于 InteractionSession 的 barge_in 中断). Partial 状态留在
+                    audio_codes/decode_buf 等 local 变量, 由调用方在 yield 期间
+                    自己累积; 这里不再单独 attach 到 generator 对象上.
+        on_step:    可选 callable(step, text_token, audio_step) — 每步采样完成后调用,
                     用于 InteractionSession 累计统计或推送状态事件.
     """
     cfg = model.config

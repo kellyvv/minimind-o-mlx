@@ -60,20 +60,38 @@ class Timeline:
 
     # ---- 派生: 从事件流重建会话历史 ----
 
-    def derive_history(self, max_turns: int = 4) -> List[dict]:
-        """从 timeline 反推出 [{role,content}, ...] 列表 (供 next-turn prompt).
+    def derive_history(
+        self,
+        max_turns: int = 4,
+        keep_interrupted: bool = False,
+        interrupted_marker: str = "[被用户打断]",
+    ) -> List[dict]:
+        """从 timeline 反推出 [{role, content}, ...] 列表 (供 next-turn prompt).
 
-        当前规则:
-          - 用户每次 ASR_RESULT 算一轮 user message
-          - 模型每次 GEN_DONE 之间的 MODEL_TEXT 串拼成一条 assistant message
-        被 BARGE_IN 打断的 assistant 截到 interrupted 时刻为止.
+        规则:
+          - 每个 ASR_RESULT (或 TEXT_DELTA) 算一轮 user message
+          - 每个 GEN_DONE 之间累积的 MODEL_TEXT 串拼成一条 assistant message
+          - 如果 GEN_DONE.payload['interrupted'] is True:
+              * keep_interrupted=False (默认): 整条 assistant 不入历史, 避免半截答案污染下文
+              * keep_interrupted=True:        保留, 末尾追加 marker (例如 \"[被用户打断]\")
+
+        被打断的 assistant 不入历史是更安全的默认 — 模型不会被自己半截的话带跑偏。
         """
         msgs: List[dict] = []
         cur_assistant: List[str] = []
         with self._lock:
             for e in self._events:
                 if e.type == "asr_result":
-                    # flush 当前 assistant
+                    if cur_assistant:
+                        # 走到这里说明 GEN_DONE 之前有新 ASR (理论上不会发生),
+                        # 当作正常 assistant 输出处理
+                        msgs.append({"role": "assistant", "content": "".join(cur_assistant)})
+                        cur_assistant = []
+                    txt = e.payload.get("text", "")
+                    if txt:
+                        msgs.append({"role": "user", "content": txt})
+                elif e.type == "text_delta":
+                    # 来自前端 type:"text" 直输入路径
                     if cur_assistant:
                         msgs.append({"role": "assistant", "content": "".join(cur_assistant)})
                         cur_assistant = []
@@ -83,7 +101,15 @@ class Timeline:
                 elif e.type == "model_text":
                     cur_assistant.append(e.payload.get("content", ""))
                 elif e.type == "gen_done":
-                    if cur_assistant:
-                        msgs.append({"role": "assistant", "content": "".join(cur_assistant)})
-                        cur_assistant = []
+                    interrupted = bool(e.payload.get("interrupted"))
+                    content = "".join(cur_assistant)
+                    cur_assistant = []
+                    if not content:
+                        continue
+                    if interrupted and not keep_interrupted:
+                        # 丢弃 partial — 下一轮 prompt 不会带入"未完成的回答"
+                        continue
+                    if interrupted and keep_interrupted:
+                        content = content + " " + interrupted_marker
+                    msgs.append({"role": "assistant", "content": content})
         return msgs[-(max_turns * 2):]
