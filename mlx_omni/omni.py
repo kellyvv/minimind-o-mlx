@@ -58,7 +58,7 @@ class MiniMindOmniLM(nn.Module):
 
     def __call__(
         self,
-        input_ids: mx.array,
+        input_ids: Optional[mx.array],
         cache: Optional[List] = None,
         spk_emb: Optional[mx.array] = None,
         inputs_embeds: Optional[mx.array] = None,
@@ -68,27 +68,35 @@ class MiniMindOmniLM(nn.Module):
             text_logits: (B, T, vocab_size)
             audio_logits_list: list[8] of (B, T, audio_vocab_size)
             new_cache: combined list, [thinker_cache] + [talker_cache]
+
+        三种调用模式 (优先级从上往下):
+          1) inputs_embeds 给定 + input_ids 是 (B, T) text_ids:
+             用 inputs_embeds 喂 Thinker (跳过 embed_tokens), audio_ids 用 audio_pad 填 8 通道.
+             适用于多模态注入 (音频 / 图像 通过 inputs_embeds 替换掉相应位置).
+          2) input_ids.ndim == 3 (B, 9, T):
+             [:, 0:8] = audio_ids, [:, 8] = text_ids. inputs_embeds 忽略.
+             适用于 decode 期间的 1-token forward (talker 需要历史 audio_ids).
+          3) input_ids.ndim == 2 + inputs_embeds=None:
+             纯文本输入, audio_ids 用 audio_pad 填.
         """
-        # 拆分输入
-        if inputs_embeds is None and input_ids.ndim == 2:
-            # 纯文本输入 → 用 audio_pad 填 8 通道
-            B, T = input_ids.shape
-            text_ids = input_ids
-            audio_ids = mx.full(
-                (B, 8, T), self.config.audio_pad_token, dtype=mx.int32
-            )
+        # 优先模式 1
+        if inputs_embeds is not None:
+            B, T = inputs_embeds.shape[:2]
+            if input_ids is not None and input_ids.ndim == 2:
+                text_ids = input_ids
+            else:
+                text_ids = mx.zeros((B, T), dtype=mx.int32)
+            audio_ids = mx.full((B, 8, T), self.config.audio_pad_token, dtype=mx.int32)
         elif input_ids.ndim == 3:
-            # (B, 9, T): [:, 0:8] audio, [:, 8] text
+            # 模式 2: 9 通道
             B, _, T = input_ids.shape
             text_ids = input_ids[:, 8, :]
             audio_ids = input_ids[:, :8, :]
         else:
-            # 多模态注入: 调用方提供 inputs_embeds, 无 audio_ids 则填 pad
-            B, T = inputs_embeds.shape[:2]
-            text_ids = mx.zeros((B, T), dtype=mx.int32)  # 占位，不会用
-            audio_ids = mx.full(
-                (B, 8, T), self.config.audio_pad_token, dtype=mx.int32
-            )
+            # 模式 3: 纯文本
+            B, T = input_ids.shape
+            text_ids = input_ids
+            audio_ids = mx.full((B, 8, T), self.config.audio_pad_token, dtype=mx.int32)
 
         # 拆缓存
         n_thinker = len(self.thinker.layers)

@@ -85,6 +85,12 @@ class SessionConfig:
     # 边界淡入淡出长度 (samples) — 在新 PCM 块开头做线性 ramp-in
     # 进一步抹平和上一块的拼接处. 0 = 关闭, 默认 240 ≈ 10ms @ 24kHz.
     audio_crossfade_samples: int = 240
+    # Stage A: 原生 audio embedding 输入 (跳过 ASR, SenseVoice encoder 直接喂模型).
+    # True: 用 EncoderBridge.encode_audio + audio_proj 注入 inputs_embeds
+    # False (默认): ASR → text → prompt (保留, 显示用户文本到 UI)
+    use_native_audio_input: bool = False
+    # native 模式下是否额外跑一次 ASR 用于 UI 显示 (不影响生成路径)
+    asr_for_display: bool = True
 
 
 class InteractionSession:
@@ -95,7 +101,8 @@ class InteractionSession:
         model,                                    # MLX OmniLM
         tokenizer,
         mimi_bridge,                              # MimiBridge 实例
-        asr_model=None,                           # FunASR AutoModel 或 None
+        asr_model=None,                           # FunASR AutoModel 或 None (display 用)
+        encoder_bridge=None,                      # EncoderBridge (native audio 输入用, stage A)
         config: Optional[SessionConfig] = None,
         logger: Optional[Callable[[str], None]] = None,
     ):
@@ -104,6 +111,7 @@ class InteractionSession:
         self.tokenizer = tokenizer
         self.mimi = mimi_bridge
         self.asr = asr_model
+        self.encoder_bridge = encoder_bridge
         self.cfg = config or SessionConfig()
         self.log = logger or print
 
@@ -331,15 +339,24 @@ class InteractionSession:
     # ====================================================================
 
     def _do_asr_and_trigger(self, audio_samples: np.ndarray):
-        """ASR + foreground 都在 main_loop 线程跑.
+        """主入口: speech_end 后处理用户音频, 选择 native 或 ASR 路径.
 
-        关键: 不开 worker thread, MLX 在非主线程的 Metal context 行为不稳。
-        生成的每一步都会从 input_q 抽干积压的 audio chunk 给 VAD,
-        VAD 触发 barge_in 时 set stop_event, 立即跳出 generate 循环。
+        两条路径:
+          A. native_audio: 跳过 ASR → SenseVoice encoder → audio_proj 注入 inputs_embeds
+                           保留 prosody/情感信息, 跳 ASR 解码后处理.
+          B. ASR (默认):   音频 → 文本 → 普通文本 prompt
+
+        UI 上始终显示用户文本 (如果 asr_for_display=True 或非 native 模式).
         """
         self._set_state(THINKING)
+
+        # 1) 决定要不要跑 ASR
+        run_asr_for_display = (
+            self.asr is not None
+            and (not self.cfg.use_native_audio_input or self.cfg.asr_for_display)
+        )
         text = ""
-        if self.asr is not None:
+        if run_asr_for_display:
             try:
                 from funasr.utils.postprocess_utils import rich_transcription_postprocess
                 t0 = time.time()
@@ -348,6 +365,25 @@ class InteractionSession:
                 self.log(f"[asr] {time.time()-t0:.2f}s: {text[:60]!r}")
             except Exception as e:
                 self.log(f"[asr] failed: {e}")
+
+        # 2) native 模式: 用 SenseVoice encoder 取 features → foreground 走 inputs_embeds
+        if self.cfg.use_native_audio_input and self.encoder_bridge is not None:
+            try:
+                t0 = time.time()
+                audio_feats = self.encoder_bridge.encode_audio(audio_samples)
+                if audio_feats is not None and audio_feats.size > 0:
+                    self.log(f"[native] encode_audio {time.time()-t0:.2f}s -> {audio_feats.shape}")
+                    self.timeline.add(Event.now(ASR_RESULT, text=text, audio_frames=int(audio_feats.shape[0])))
+                    self._send({"type": "user_prompt", "content": text or "(audio in)"})
+                    self._foreground_generate(prompt=text or "", audio_features_np=audio_feats)
+                    return
+                else:
+                    self.log("[native] encoder returned empty, fallback to text path")
+            except Exception as e:
+                import traceback; traceback.print_exc()
+                self.log(f"[native] encode failed: {e} — fallback to text path")
+
+        # 3) Fallback ASR text path
         self.timeline.add(Event.now(ASR_RESULT, text=text))
         self._send({"type": "user_prompt", "content": text or "(无识别)"})
         if not text:
@@ -384,13 +420,14 @@ class InteractionSession:
                 except Exception:
                     pass
 
-    def _foreground_generate(self, prompt: str):
+    def _foreground_generate(self, prompt: str, audio_features_np=None):
         """在 main_loop 线程跑生成 (MLX 不能在子线程稳定运行).
 
-        新增能力 (stage 2/3):
-          - 自动消费 background scheduler 已完成的结果, 注入 prompt 头
-          - 可选用 OmniStreamingSession (cfg.use_streaming_session) 复用 KV cache
+        新增能力 (stage 2/3/A):
+          - 自动消费 background scheduler 已完成的结果, 注入 prompt 头 (stage 2)
+          - 可选用 OmniStreamingSession (cfg.use_streaming_session) 复用 KV cache (stage 3)
           - 流式 Mimi 解码带 overlap + 端口 crossfade (P2b 修复颤抖)
+          - audio_features_np 给定时走 native audio input 路径 (跳 ASR, stage A)
         """
         history_full = self.timeline.derive_history(max_turns=self.cfg.max_history_turns + 1)
         history = history_full[:-1] if history_full and history_full[-1].get("role") == "user" else history_full
@@ -415,7 +452,8 @@ class InteractionSession:
         self.log(f"[fg] start[{mode}], prompt={full_prompt[:60]!r}, history_len={len(history)}")
 
         # Stage 3: 选择生成路径
-        if self.cfg.use_streaming_session:
+        if self.cfg.use_streaming_session and audio_features_np is None:
+            # 注: streaming session 暂不支持 audio embedding 注入 — 用 stateless 兜底
             gen_iter = self._streaming_generate(full_prompt, history)
         else:
             from mlx_omni.generate_omni import stream_generate_omni
@@ -431,6 +469,7 @@ class InteractionSession:
                 audio_greedy=self.cfg.audio_greedy,
                 history=history,
                 stop_event=self._fg_stop_event,
+                audio_features_np=audio_features_np,
             )
 
         try:

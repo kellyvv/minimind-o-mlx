@@ -116,6 +116,8 @@ def stream_generate_omni(
     spk_emb: Optional[mx.array] = None,
     stop_event=None,
     on_step=None,
+    audio_features_np=None,         # numpy (T_audio, audio_hidden=512) 或 None
+    user_text_template: Optional[str] = None,  # 当 audio_features_np 给定时使用, 例如 "<|audio_pad|>" * N
 ) -> Iterator[Tuple[Optional[str], Optional[List[int]]]]:
     """流式生成器。
 
@@ -136,11 +138,21 @@ def stream_generate_omni(
         eos_token_id = tokenizer.eos_token_id or 2
 
     # 1. tokenize prompt
-    msgs = (history or []) + [{"role": "user", "content": prompt}]
+    # 原生 audio input 路径: user message 用 <|audio_pad|>*N 占位, 后面通过
+    # inputs_embeds 把 audio_proj(audio_features) 注入到对应位置.
+    if audio_features_np is not None and audio_features_np.size > 0:
+        T_audio = int(audio_features_np.shape[0])
+        # 用 audio_pad 字面字符串构造 user message
+        audio_marker = cfg.audio_special_token if hasattr(cfg, "audio_special_token") else "<|audio_pad|>"
+        user_content = (user_text_template or "") + audio_marker * T_audio
+    else:
+        user_content = prompt
+
+    msgs = (history or []) + [{"role": "user", "content": user_content}]
     if use_chat_template:
         text = tokenizer.apply_chat_template(msgs, tokenize=False, add_generation_prompt=True)
     else:
-        text = prompt
+        text = user_content
     ids = tokenizer(text)["input_ids"]
     input_ids = mx.array([ids], dtype=mx.int32)  # (1, T0)
     start_pos = input_ids.shape[1]
@@ -149,11 +161,23 @@ def stream_generate_omni(
     audio_buffer = mx.full(
         (1, 8, start_pos), cfg.audio_pad_token, dtype=mx.int32
     )
-    # 拼成 (1, 9, T0): 前 8 是 audio, 第 9 是 text
-    nine_chan = mx.concatenate([audio_buffer, input_ids[:, None, :]], axis=1)
 
-    # 3. prefill
-    text_logits, audio_logits_list, cache = model(nine_chan, spk_emb=spk_emb)
+    # 3. prefill — 区分两条路径
+    if audio_features_np is not None and audio_features_np.size > 0:
+        # 原生音频输入: 构造 inputs_embeds 把 audio_proj 输出注入到 audio_pad 位置
+        from .encoder_bridge import build_audio_injected_embeds
+        audio_pad_id = cfg.audio_ids[0] if hasattr(cfg, "audio_ids") else 16
+        inputs_embeds = build_audio_injected_embeds(
+            model, input_ids, audio_features_np, audio_pad_token=audio_pad_id,
+        )
+        # 用 inputs_embeds + input_ids 走模式 1
+        text_logits, audio_logits_list, cache = model(
+            input_ids, spk_emb=spk_emb, inputs_embeds=inputs_embeds,
+        )
+    else:
+        # 原 9 通道路径
+        nine_chan = mx.concatenate([audio_buffer, input_ids[:, None, :]], axis=1)
+        text_logits, audio_logits_list, cache = model(nine_chan, spk_emb=spk_emb)
     mx.eval(text_logits, *audio_logits_list, *(c[0] for c in cache), *(c[1] for c in cache))
 
     # state

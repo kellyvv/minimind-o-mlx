@@ -83,6 +83,25 @@ def _load_all(args):
     else:
         M['asr'] = None
 
+    # Stage A: 加载 EncoderBridge (跟 ASR 共用 SenseVoice 编码器, 用于 native audio path)
+    print(f"[load] EncoderBridge (cpu SenseVoice encoder for native input) ...")
+    t0 = time.time()
+    try:
+        from mlx_omni.encoder_bridge import EncoderBridge
+        M['encoder_bridge'] = EncoderBridge(
+            audio_dir=args.sensevoice_dir,
+            vision_dir=None,         # vision 暂不接, 留位
+            device='cpu',
+        )
+        if M['encoder_bridge']._audio_encoder is None:
+            M['encoder_bridge'] = None
+            print(f"[warn] EncoderBridge audio encoder is None — native audio path will not work")
+        else:
+            print(f"[load] EncoderBridge done in {time.time()-t0:.2f}s")
+    except Exception as e:
+        print(f"[warn] EncoderBridge load failed: {e}")
+        M['encoder_bridge'] = None
+
     print("[warmup] running warmup gen...")
     t0 = time.time()
     from mlx_omni.generate_omni import stream_generate_omni
@@ -257,14 +276,17 @@ def realtime(ws):
         tokenizer=M['tokenizer'],
         mimi_bridge=M['mimi'],
         asr_model=M.get('asr'),
+        encoder_bridge=M.get('encoder_bridge'),
         config=SessionConfig(
             audio_chunk_frames=12,
             foreground_temperature=0.7,
             audio_rep_penalty=1.0,
             # Stage 3 默认关 — KV cache 跨 turn 复用有一致性风险, 收益对 0.1B 模型有限.
-            # 想 A/B 直接改下面这行为 True 重启即可.
             use_streaming_session=False,
             inject_bg_results=True,        # Stage 2 默认开 — 后台任务结果会前置注入
+            # Stage A — 原生 audio embedding 路径
+            use_native_audio_input=True,   # 默认开: 跳 ASR 走 inputs_embeds
+            asr_for_display=True,          # 同时跑一次 ASR 把识别文本显示到 UI (不影响生成)
         ),
         logger=print,
     )
