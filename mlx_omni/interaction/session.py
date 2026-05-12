@@ -91,6 +91,11 @@ class SessionConfig:
     use_native_audio_input: bool = False
     # native 模式下是否额外跑一次 ASR 用于 UI 显示 (不影响生成路径)
     asr_for_display: bool = True
+    # Stage B: 注入 elapsed-time marker 让模型感知会话时长.
+    # 在每轮 user prompt 头部加 "[t=N.Ns]" 文本. 零样本下 0.1B 模型可能用不上,
+    # 但架构上保留这条信号通路, 未来训练时可让模型学到时间感知。
+    inject_elapsed_time: bool = False
+    elapsed_time_format: str = "[t={elapsed:.1f}s]"
 
 
 class InteractionSession:
@@ -142,6 +147,9 @@ class InteractionSession:
 
         # PCM crossfade 状态: 每 turn 第一块不做 ramp-in
         self._first_audio_chunk_of_turn = True
+
+        # 会话开始时间 (用于 elapsed-time marker)
+        self._session_start = time.monotonic()
 
     # ====================================================================
     # 状态控制
@@ -440,6 +448,12 @@ class InteractionSession:
         else:
             full_prompt = prompt
 
+        # Stage B: elapsed-time marker (放到 prompt 头部, 或 native 模式作为 user_text_template)
+        elapsed_marker = ""
+        if self.cfg.inject_elapsed_time:
+            elapsed = time.monotonic() - self._session_start
+            elapsed_marker = self.cfg.elapsed_time_format.format(elapsed=elapsed) + " "
+
         self._set_state(SPEAKING)
         self._fg_stop_event.clear()
         t0 = time.time()
@@ -448,17 +462,33 @@ class InteractionSession:
         audio_pending: List[List[int]] = []     # 本块还没解码的新帧
         audio_history: List[List[int]] = []     # 本 turn 已生成的全部帧 (用作 overlap 上下文)
         interrupted = False
-        mode = "streaming" if self.cfg.use_streaming_session else "stateless"
-        self.log(f"[fg] start[{mode}], prompt={full_prompt[:60]!r}, history_len={len(history)}")
+        if audio_features_np is not None:
+            mode = "native-audio"
+            prompt_label = f"<|audio_pad|>x{audio_features_np.shape[0]} (ASR display: {full_prompt[:30]!r})"
+        elif self.cfg.use_streaming_session:
+            mode = "streaming"
+            prompt_label = repr(full_prompt[:60])
+        else:
+            mode = "stateless"
+            prompt_label = repr(full_prompt[:60])
+        self.log(f"[fg] start[{mode}], prompt={prompt_label}, history_len={len(history)}")
 
         # Stage 3: 选择生成路径
         if self.cfg.use_streaming_session and audio_features_np is None:
             # 注: streaming session 暂不支持 audio embedding 注入 — 用 stateless 兜底
-            gen_iter = self._streaming_generate(full_prompt, history)
+            # elapsed marker 直接拼到 full_prompt
+            gen_iter = self._streaming_generate(elapsed_marker + full_prompt, history)
         else:
             from mlx_omni.generate_omni import stream_generate_omni
+            if audio_features_np is not None:
+                # native audio: elapsed marker 作为 user_text_template (audio token 之前的文字前缀)
+                text_template = elapsed_marker if elapsed_marker else None
+                prompt_for_gen = full_prompt   # 仅作日志用
+            else:
+                text_template = None
+                prompt_for_gen = elapsed_marker + full_prompt
             gen_iter = stream_generate_omni(
-                self.model, self.tokenizer, full_prompt,
+                self.model, self.tokenizer, prompt_for_gen,
                 max_new_tokens=self.cfg.foreground_max_new_tokens,
                 temperature=self.cfg.foreground_temperature,
                 top_p=self.cfg.foreground_top_p,
@@ -470,6 +500,7 @@ class InteractionSession:
                 history=history,
                 stop_event=self._fg_stop_event,
                 audio_features_np=audio_features_np,
+                user_text_template=text_template,
             )
 
         try:

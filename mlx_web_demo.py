@@ -281,12 +281,15 @@ def realtime(ws):
             audio_chunk_frames=12,
             foreground_temperature=0.7,
             audio_rep_penalty=1.0,
-            # Stage 3 默认关 — KV cache 跨 turn 复用有一致性风险, 收益对 0.1B 模型有限.
-            use_streaming_session=False,
+            # Stage 3 默认开 — 已用 greedy 多轮测试验证 streaming 与 stateless 输出 1:1 一致
+            # (见 mlx_omni/interaction/_test_streaming_session.py)
+            use_streaming_session=True,
             inject_bg_results=True,        # Stage 2 默认开 — 后台任务结果会前置注入
             # Stage A — 原生 audio embedding 路径
             use_native_audio_input=True,   # 默认开: 跳 ASR 走 inputs_embeds
             asr_for_display=True,          # 同时跑一次 ASR 把识别文本显示到 UI (不影响生成)
+            # Stage B — elapsed-time marker (低风险, 默认开做实验)
+            inject_elapsed_time=True,
         ),
         logger=print,
     )
