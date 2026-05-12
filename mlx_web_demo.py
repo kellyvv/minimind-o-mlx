@@ -236,125 +236,35 @@ def call_page():
 
 @sock.route('/ws/realtime')
 def realtime(ws):
-    """实时通话 (VAD-driven 半双工).
+    """实时通话 — Interaction-Model stage 1.
 
-    流程: 用户说话 → VAD 检测 speech_end → ASR 转文本 → MLX 生成 text+audio → 流回
-    用户在生成中再次说话 → VAD interrupt → 中断生成
+    使用 InteractionSession 接管整个会话生命周期:
+      - recv_loop / output_loop / main_loop / foreground_loop 解耦, 分别独立线程
+      - 所有事件 (audio_chunk / VAD / ASR / model_text / model_audio / barge_in...)
+        统一打到一个 Timeline 上, foreground 内重新派生 history
+      - 中途 barge_in: 立即 set foreground stop_event, 不破坏 session 状态
+      - background scheduler 接口已就位 (mlx_omni.interaction.background), stage 2 启用
+
+    参考: Thinking Machines "Interaction Models" (2025).
     """
-    import queue
-    from model.model_omni import RealtimeSession
+    from mlx_omni.interaction import InteractionSession, SessionConfig
 
     vad_path = str(Path(__file__).parent / 'model' / 'vad' / 'silero_vad.onnx')
-    session = RealtimeSession(vad_path)
-    q = queue.Queue()
-    alive = [True]
-    state = {'history': [], 'voice': 'default'}
-
-    def push_audio(data):
-        return session.push_chunk(np.frombuffer(data, dtype=np.int16).astype(np.float32) / 32768.0)
-
-    def poll_interrupt():
-        """检查队列里是否有新音频/控制消息，触发打断."""
-        while True:
-            try: data = q.get_nowait()
-            except queue.Empty: return False
-            if isinstance(data, bytes):
-                if push_audio(data) == 'interrupt':
-                    return True
-                ws.send(json.dumps({'type': 'vad', 'speaking': session.speaking}))
-            else:
-                m = json.loads(data)
-                if m.get('type') in ('stop', 'end'):
-                    if m['type'] == 'end': alive[0] = False
-                    session.interrupt = True
-                    return True
-
-    def recv_loop():
-        while alive[0]:
-            try:
-                data = ws.receive(timeout=1)
-                if data is None: alive[0] = False; break
-                q.put(data)
-            except: alive[0] = False; break
-
-    threading.Thread(target=recv_loop, daemon=True).start()
-    try:
-        while alive[0]:
-            try: data = q.get(timeout=0.05)
-            except queue.Empty: continue
-            if isinstance(data, str):
-                m = json.loads(data)
-                if m.get('type') == 'context':
-                    state['history'] = (m.get('history') or [])[-2:]
-                    state['voice'] = m.get('voice', 'default')
-                elif m.get('type') == 'stop': session.interrupt = True
-                elif m.get('type') == 'end': break
-                continue
-            if session.generating:
-                push_audio(data)
-                ws.send(json.dumps({'type': 'vad', 'speaking': session.speaking}))
-                continue
-            status = push_audio(data)
-            ws.send(json.dumps({'type': 'vad', 'speaking': session.speaking}))
-            if status != 'speech_end': continue
-
-            # 一段语音结束，开始处理
-            session.generating = True
-            audio_samples = session.get_audio()
-            ws.send(json.dumps({'type': 'generating'}))
-
-            # ASR: 语音 → 文本 (MLX 版暂用 PyTorch ASR + 文本喂 MLX，绕开 SenseVoice 编码器移植)
-            t0 = time.time()
-            user_text = _asr(audio_samples) if M['asr'] else ''
-            print(f'[asr] {time.time()-t0:.2f}s: {user_text[:60]!r}')
-            ws.send(json.dumps({'type': 'user_prompt', 'content': user_text or '(无识别)'}))
-            if not user_text:
-                session.generating = False
-                continue
-
-            # MLX 生成 text + audio
-            from mlx_omni.generate_omni import stream_generate_omni
-            with MODEL_LOCK:
-                full_text = ''
-                audio_buffer = []
-                CHUNK_FRAMES = 12
-                interrupted = False
-                for text_seg, audio_frame in stream_generate_omni(
-                    M['model'], M['tokenizer'], user_text,
-                    max_new_tokens=512, temperature=0.7, top_p=0.85, top_k=50,
-                    audio_temperature=0.2, audio_top_k=50, audio_rep_penalty=1.0,
-                    history=state['history'],
-                ):
-                    if poll_interrupt() or session.interrupt:
-                        interrupted = True; break
-                    if text_seg:
-                        ws.send(json.dumps({'type': 'text', 'content': text_seg}))
-                        full_text += text_seg
-                    if audio_frame:
-                        audio_buffer.append(audio_frame)
-                        if len(audio_buffer) >= CHUNK_FRAMES:
-                            pcm = _decode_pcm_chunk(audio_buffer)
-                            audio_buffer = []
-                            if pcm:
-                                ws.send(json.dumps({'type': 'pcm',
-                                                     'data': base64.b64encode(pcm).decode()}))
-                if not interrupted and audio_buffer:
-                    pcm = _decode_pcm_chunk(audio_buffer)
-                    if pcm:
-                        ws.send(json.dumps({'type': 'pcm',
-                                             'data': base64.b64encode(pcm).decode()}))
-
-            # 累计历史 (留 1 轮即可，MLX 版本不带 max_history_turns 配置)
-            if user_text: state['history'].append({'role': 'user', 'content': user_text})
-            if full_text: state['history'].append({'role': 'assistant', 'content': full_text})
-            state['history'] = state['history'][-2:]
-
-            ws.send(json.dumps({'type': 'done',
-                                 'interrupted': interrupted or session.interrupt}))
-            session.generating = False
-            session.interrupt = False
-    finally:
-        alive[0] = False
+    sess = InteractionSession(
+        ws=ws,
+        vad_path=vad_path,
+        model=M['model'],
+        tokenizer=M['tokenizer'],
+        mimi_bridge=M['mimi'],
+        asr_model=M.get('asr'),
+        config=SessionConfig(
+            audio_chunk_frames=12,
+            foreground_temperature=0.7,
+            audio_rep_penalty=1.0,
+        ),
+        logger=print,
+    )
+    sess.run()
 
 
 # ============================================================================
